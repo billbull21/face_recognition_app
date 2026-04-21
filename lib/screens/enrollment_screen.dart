@@ -80,16 +80,14 @@ class _EnrollmentScreenState extends State<EnrollmentScreen> {
 
     setState(() => _isCapturing = true);
 
-    // We need the raw CameraImage — trigger a single capture
-    _cameraController.cameraController?.stopImageStream();
-    await _cameraController.cameraController?.takePicture(); // just to flush
-
     // Re-start stream to grab the next frame for embedding
     bool captured = false;
     _cameraController.cameraController?.startImageStream((image) async {
       if (captured) return;
       captured = true;
-      _cameraController.cameraController?.stopImageStream();
+      if (_cameraController.cameraController?.value.isStreamingImages == true) {
+        _cameraController.cameraController?.stopImageStream();
+      }
 
       final embedding = await _embedder.extractEmbedding(image, faces.first);
       if (mounted) {
@@ -104,7 +102,7 @@ class _EnrollmentScreenState extends State<EnrollmentScreen> {
             _errorMessage = 'Failed to extract face embedding. Try again.';
             _isCapturing = false;
           });
-          _cameraController.cameraController?.startImageStream((_) {});
+          _cameraController.restartImageStream();
         }
       }
     });

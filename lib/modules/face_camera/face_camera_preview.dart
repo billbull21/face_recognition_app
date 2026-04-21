@@ -3,16 +3,22 @@ import 'package:flutter/material.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'face_camera_controller.dart';
 
-/// Paints bounding boxes around all detected faces.
+/// Paints bounding boxes mapped to BoxFit.cover screen coordinates.
 class FaceBoundingBoxPainter extends CustomPainter {
   final List<Face> faces;
   final Size imageSize;
   final bool isFrontCamera;
+  final double scale;
+  final double offsetX;
+  final double offsetY;
 
-  FaceBoundingBoxPainter({
+  const FaceBoundingBoxPainter({
     required this.faces,
     required this.imageSize,
     required this.isFrontCamera,
+    required this.scale,
+    required this.offsetX,
+    required this.offsetY,
   });
 
   @override
@@ -23,36 +29,35 @@ class FaceBoundingBoxPainter extends CustomPainter {
       ..strokeWidth = 2.5;
 
     for (final face in faces) {
-      final rect = _scaleRect(face.boundingBox, size);
-      canvas.drawRect(rect, paint);
+      canvas.drawRect(_scaleRect(face.boundingBox, size), paint);
     }
   }
 
   Rect _scaleRect(Rect rect, Size widgetSize) {
-    final scaleX = widgetSize.width / imageSize.width;
-    final scaleY = widgetSize.height / imageSize.height;
-
-    double left = isFrontCamera
-        ? widgetSize.width - rect.right * scaleX
-        : rect.left * scaleX;
-    double right = isFrontCamera
-        ? widgetSize.width - rect.left * scaleX
-        : rect.right * scaleX;
+    // With BoxFit.cover, a uniform scale is applied and one axis may be cropped.
+    // offsetX/offsetY are negative when the image extends beyond the widget edge.
+    final double left = isFrontCamera
+        ? widgetSize.width - (rect.right * scale + offsetX)
+        : rect.left * scale + offsetX;
+    final double right = isFrontCamera
+        ? widgetSize.width - (rect.left * scale + offsetX)
+        : rect.right * scale + offsetX;
 
     return Rect.fromLTRB(
       left,
-      rect.top * scaleY,
+      rect.top * scale + offsetY,
       right,
-      rect.bottom * scaleY,
+      rect.bottom * scale + offsetY,
     );
   }
 
   @override
   bool shouldRepaint(FaceBoundingBoxPainter oldDelegate) =>
-      oldDelegate.faces != faces;
+      oldDelegate.faces != faces || oldDelegate.scale != scale;
 }
 
 /// Full-screen camera preview with bounding box overlay.
+/// Uses BoxFit.cover so the preview fills the screen without stretching.
 class FaceCameraPreview extends StatelessWidget {
   final FaceCameraController controller;
 
@@ -60,28 +65,54 @@ class FaceCameraPreview extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (!controller.isInitialized || controller.cameraController == null) {
+    if (!controller.isInitialized ||
+        controller.cameraController == null ||
+        controller.previewSize == null) {
       return const Center(child: CircularProgressIndicator());
     }
 
-    final cameraController = controller.cameraController!;
-    final isFront =
-        cameraController.description.lensDirection ==
-        CameraLensDirection.front;
+    final cam = controller.cameraController!;
+    final isFront = cam.description.lensDirection == CameraLensDirection.front;
+    final previewSize = controller.previewSize!;
 
-    return Stack(
-      fit: StackFit.expand,
-      children: [
-        CameraPreview(cameraController),
-        if (controller.previewSize != null)
-          CustomPaint(
-            painter: FaceBoundingBoxPainter(
-              faces: controller.detectedFaces,
-              imageSize: controller.previewSize!,
-              isFrontCamera: isFront,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final screenSize = constraints.biggest;
+
+        // Compute the uniform scale factor for BoxFit.cover
+        final scaleX = screenSize.width / previewSize.width;
+        final scaleY = screenSize.height / previewSize.height;
+        final scale = scaleX > scaleY ? scaleX : scaleY;
+
+        // Offset is negative on the cropped axis (image extends past widget edge)
+        final offsetX = (screenSize.width - previewSize.width * scale) / 2;
+        final offsetY = (screenSize.height - previewSize.height * scale) / 2;
+
+        return Stack(
+          fit: StackFit.expand,
+          children: [
+            // FittedBox.cover fills the screen without distorting aspect ratio
+            FittedBox(
+              fit: BoxFit.cover,
+              child: SizedBox(
+                width: previewSize.width,
+                height: previewSize.height,
+                child: CameraPreview(cam),
+              ),
             ),
-          ),
-      ],
+            CustomPaint(
+              painter: FaceBoundingBoxPainter(
+                faces: controller.detectedFaces,
+                imageSize: previewSize,
+                isFrontCamera: isFront,
+                scale: scale,
+                offsetX: offsetX,
+                offsetY: offsetY,
+              ),
+            ),
+          ],
+        );
+      },
     );
   }
 }

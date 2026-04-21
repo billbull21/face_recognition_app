@@ -38,7 +38,8 @@ class FaceCameraController extends ChangeNotifier {
         enableLandmarks: true,
         enableContours: false,
         enableTracking: true,
-        performanceMode: FaceDetectorMode.fast,
+        // accurate mode detects faces reliably on lower-quality cameras
+        performanceMode: FaceDetectorMode.accurate,
       ),
     );
 
@@ -65,6 +66,14 @@ class FaceCameraController extends ChangeNotifier {
     _cameraController!.startImageStream(_onCameraImage);
     _isInitialized = true;
     notifyListeners();
+  }
+
+  /// Restarts the image stream using the internal face-detection handler.
+  /// Call this after manually stopping the stream (e.g. for a single-frame capture).
+  void restartImageStream() {
+    if (_cameraController == null || !_isInitialized) return;
+    if (_cameraController!.value.isStreamingImages) return;
+    _cameraController!.startImageStream(_onCameraImage);
   }
 
   Future<void> switchCamera() async {
@@ -108,31 +117,92 @@ class FaceCameraController extends ChangeNotifier {
   }
 
   InputImage? _buildInputImage(CameraImage image, InputImageRotation rotation) {
-    if (image.format.group != ImageFormatGroup.nv21 &&
-        image.format.group != ImageFormatGroup.yuv420) {
-      return null;
+    // iOS uses BGRA8888 (single plane)
+    if (image.format.group == ImageFormatGroup.bgra8888) {
+      return InputImage.fromBytes(
+        bytes: image.planes[0].bytes,
+        metadata: InputImageMetadata(
+          size: Size(image.width.toDouble(), image.height.toDouble()),
+          rotation: rotation,
+          format: InputImageFormat.bgra8888,
+          bytesPerRow: image.planes[0].bytesPerRow,
+        ),
+      );
     }
 
-    final WriteBuffer allBytes = WriteBuffer();
-    for (final Plane plane in image.planes) {
-      allBytes.putUint8List(plane.bytes);
+    // Android: NV21 is already in the correct format (single plane)
+    if (image.format.group == ImageFormatGroup.nv21) {
+      return InputImage.fromBytes(
+        bytes: image.planes[0].bytes,
+        metadata: InputImageMetadata(
+          size: Size(image.width.toDouble(), image.height.toDouble()),
+          rotation: rotation,
+          format: InputImageFormat.nv21,
+          bytesPerRow: image.planes[0].bytesPerRow,
+        ),
+      );
     }
-    final bytes = allBytes.done().buffer.asUint8List();
 
-    return InputImage.fromBytes(
-      bytes: bytes,
-      metadata: InputImageMetadata(
-        size: Size(image.width.toDouble(), image.height.toDouble()),
-        rotation: rotation,
-        format: InputImageFormat.nv21,
-        bytesPerRow: image.planes[0].bytesPerRow,
-      ),
-    );
+    // Android: YUV_420_888 (3 separate planes) — convert to NV21 properly.
+    // Simply concatenating planes is wrong because each plane has its own
+    // row stride/padding that must be stripped.
+    if (image.format.group == ImageFormatGroup.yuv420) {
+      final nv21 = _yuv420ToNv21(image);
+      return InputImage.fromBytes(
+        bytes: nv21,
+        metadata: InputImageMetadata(
+          size: Size(image.width.toDouble(), image.height.toDouble()),
+          rotation: rotation,
+          format: InputImageFormat.nv21,
+          bytesPerRow: image.width,
+        ),
+      );
+    }
+
+    return null;
+  }
+
+  /// Converts Android YUV_420_888 (3-plane) to NV21 (Y + interleaved VU),
+  /// correctly stripping row padding from each plane.
+  Uint8List _yuv420ToNv21(CameraImage image) {
+    final int width = image.width;
+    final int height = image.height;
+    final yPlane = image.planes[0];
+    final uPlane = image.planes[1];
+    final vPlane = image.planes[2];
+
+    final nv21 = Uint8List((width * height * 1.5).round());
+
+    // Copy Y plane, stripping row padding
+    for (int row = 0; row < height; row++) {
+      nv21.setRange(
+        row * width,
+        row * width + width,
+        yPlane.bytes,
+        row * yPlane.bytesPerRow,
+      );
+    }
+
+    // Interleave V then U after Y (NV21 = Y + VU)
+    int uvOffset = width * height;
+    final uvPixelStride = uPlane.bytesPerPixel ?? 1;
+    for (int row = 0; row < height ~/ 2; row++) {
+      for (int col = 0; col < width ~/ 2; col++) {
+        final int srcIndex = row * uPlane.bytesPerRow + col * uvPixelStride;
+        nv21[uvOffset++] =
+            vPlane.bytes[row * vPlane.bytesPerRow + col * (vPlane.bytesPerPixel ?? 1)];
+        nv21[uvOffset++] = uPlane.bytes[srcIndex];
+      }
+    }
+
+    return nv21;
   }
 
   @override
   void dispose() {
-    _cameraController?.stopImageStream();
+    if (_cameraController?.value.isStreamingImages == true) {
+      _cameraController?.stopImageStream();
+    }
     _cameraController?.dispose();
     _faceDetector?.close();
     super.dispose();

@@ -5,8 +5,9 @@ import '../modules/face_camera/face_camera_preview.dart';
 import '../modules/face_liveness/face_liveness_controller.dart';
 import '../modules/face_embedder/face_embedder.dart';
 import '../modules/face_store/face_store.dart';
+import 'verification_result_screen.dart';
 
-enum _VerificationStep { liveness, matching, result }
+enum _VerificationStep { liveness, matching }
 
 class VerificationScreen extends StatefulWidget {
   const VerificationScreen({super.key});
@@ -22,7 +23,6 @@ class _VerificationScreenState extends State<VerificationScreen> {
 
   _VerificationStep _step = _VerificationStep.liveness;
   String? _errorMessage;
-  MatchResult? _result;
 
   @override
   void initState() {
@@ -82,29 +82,38 @@ class _VerificationScreenState extends State<VerificationScreen> {
           _step = _VerificationStep.liveness;
         });
         _livenessController.start();
-        _cameraController.cameraController?.startImageStream((_) {});
+        _cameraController.restartImageStream();
         return;
       }
 
       final store = context.read<FaceStore>();
       final result = store.match(embedding);
-      setState(() {
-        _result = result;
-        _step = _VerificationStep.result;
-      });
+
+      if (!mounted) return;
+      // Navigate to full-screen result page.
+      // Returns false = retry, true/null = go back to home.
+      final goHome = await Navigator.of(context).push<bool>(
+        MaterialPageRoute(
+          builder: (_) => VerificationResultScreen(result: result),
+        ),
+      );
+      if (!mounted) return;
+      if (goHome == true) {
+        Navigator.of(context).pop();
+      } else {
+        _retry();
+      }
     });
   }
 
   void _retry() {
     setState(() {
       _step = _VerificationStep.liveness;
-      _result = null;
       _errorMessage = null;
     });
     _livenessController.reset();
     _livenessController.start();
-    // Restart image stream
-    _cameraController.cameraController?.startImageStream((_) {});
+    _cameraController.restartImageStream();
   }
 
   @override
@@ -125,8 +134,7 @@ class _VerificationScreenState extends State<VerificationScreen> {
       ),
       body: Stack(
         children: [
-          if (_step != _VerificationStep.result)
-            ListenableBuilder(
+          ListenableBuilder(
               listenable: _cameraController,
               builder: (_, w) =>
                   FaceCameraPreview(controller: _cameraController),
@@ -161,8 +169,6 @@ class _VerificationScreenState extends State<VerificationScreen> {
         return _livenessPanel();
       case _VerificationStep.matching:
         return _matchingPanel();
-      case _VerificationStep.result:
-        return _resultPanel();
     }
   }
 
@@ -194,46 +200,6 @@ class _VerificationScreenState extends State<VerificationScreen> {
           CircularProgressIndicator(color: Colors.white),
           SizedBox(height: 12),
           Text('Identifying...', style: TextStyle(color: Colors.white, fontSize: 16)),
-        ],
-      ),
-    );
-  }
-
-  Widget _resultPanel() {
-    final result = _result;
-    if (result == null) return const SizedBox.shrink();
-
-    final matched = result.matched;
-    return _card(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(
-            matched ? Icons.check_circle : Icons.cancel,
-            color: matched ? Colors.greenAccent : Colors.redAccent,
-            size: 52,
-          ),
-          const SizedBox(height: 8),
-          Text(
-            matched ? 'Match Found: ${result.label}' : 'No Match',
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 20,
-              fontWeight: FontWeight.bold,
-            ),
-            textAlign: TextAlign.center,
-          ),
-          const SizedBox(height: 4),
-          Text(
-            'Similarity: ${(result.similarity * 100).toStringAsFixed(1)}%',
-            style: const TextStyle(color: Colors.white70, fontSize: 14),
-          ),
-          const SizedBox(height: 16),
-          ElevatedButton.icon(
-            onPressed: _retry,
-            icon: const Icon(Icons.refresh),
-            label: const Text('Try Again'),
-          ),
         ],
       ),
     );

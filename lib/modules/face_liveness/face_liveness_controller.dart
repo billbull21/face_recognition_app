@@ -4,20 +4,41 @@ import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 
 enum LivenessChallenge { blink, turnLeft, turnRight }
 
-enum LivenessState { idle, inProgress, passed, failed }
+enum LivenessState { idle, waitingForFace, inProgress, centering, passed, failed }
 
 /// Orchestrates the blink and head-turn liveness challenge flow.
 ///
 /// Feed detected [Face] objects from ML Kit via [processFace].
 class FaceLivenessController extends ChangeNotifier {
-  static const int _timeoutSeconds = 10;
-  static const double _eyeClosedThreshold = 0.3;
-  static const double _headTurnThreshold = 20.0;
+  static const int _timeoutSeconds = 15;
+
+  // Eye open probability below this value = eye closed
+  static const double _eyeClosedThreshold = 0.4;
+  // Eye open probability above this value = eye open (for state machine reset)
+  static const double _eyeOpenThreshold = 0.6;
+
+  // Head must exceed this angle (degrees) to count as a turn
+  static const double _headTurnThreshold = 18.0;
+  // Head must stay past threshold for this many frames to confirm the turn
+  static const int _headTurnConfirmFrames = 4;
+
+  // After all challenges, face must be frontal for this many frames before passing
+  static const int _centerConfirmFrames = 5;
+  static const double _centerAngleThreshold = 12.0;
 
   LivenessState state = LivenessState.idle;
   List<LivenessChallenge> _challenges = [];
   int _currentIndex = 0;
   Timer? _timer;
+
+  // Blink state machine: track open → closed transition
+  bool _eyesWereOpen = false;
+
+  // Head turn state machine: count consecutive frames past threshold
+  int _headTurnFrameCount = 0;
+
+  // Centering state machine: count consecutive frontal frames after challenges
+  int _centerFrameCount = 0;
 
   /// Returns the current challenge the user must complete.
   LivenessChallenge? get currentChallenge =>
@@ -25,26 +46,40 @@ class FaceLivenessController extends ChangeNotifier {
 
   /// Human-readable instruction for the current challenge.
   String get instruction {
-    switch (currentChallenge) {
-      case LivenessChallenge.blink:
-        return 'Please blink your eyes';
-      case LivenessChallenge.turnLeft:
-        return 'Turn your head left';
-      case LivenessChallenge.turnRight:
-        return 'Turn your head right';
-      case null:
-        if (state == LivenessState.passed) return 'Liveness check passed!';
-        if (state == LivenessState.failed) return 'Liveness check failed. Try again.';
+    switch (state) {
+      case LivenessState.idle:
         return 'Position your face in the frame';
+      case LivenessState.waitingForFace:
+        return 'Hold still — detecting your face...';
+      case LivenessState.passed:
+        return 'Liveness check passed!';
+      case LivenessState.centering:
+        return 'Now look straight at the camera';
+      case LivenessState.failed:
+        return 'Liveness check failed. Try again.';
+      case LivenessState.inProgress:
+        switch (currentChallenge) {
+          case LivenessChallenge.blink:
+            return 'Please blink your eyes';
+          case LivenessChallenge.turnLeft:
+            return 'Turn your head to the LEFT';
+          case LivenessChallenge.turnRight:
+            return 'Turn your head to the RIGHT';
+          case null:
+            return 'Hold on...';
+        }
     }
   }
 
-  /// Starts a new liveness check with randomised challenge order.
+  /// Starts a new liveness check. Waits for face detection before
+  /// beginning the challenge timer.
   void start() {
     _currentIndex = 0;
-    state = LivenessState.inProgress;
+    state = LivenessState.waitingForFace;
     _challenges = _buildChallenges();
-    _startTimer();
+    _eyesWereOpen = false;
+    _headTurnFrameCount = 0;
+    _centerFrameCount = 0;
     notifyListeners();
   }
 
@@ -53,12 +88,51 @@ class FaceLivenessController extends ChangeNotifier {
     _currentIndex = 0;
     state = LivenessState.idle;
     _challenges = [];
+    _eyesWereOpen = false;
+    _headTurnFrameCount = 0;
+    _centerFrameCount = 0;
     notifyListeners();
   }
 
   /// Call this every time new [Face] data arrives from ML Kit.
   void processFace(Face? face) {
-    if (state != LivenessState.inProgress || face == null) return;
+    if (state == LivenessState.idle ||
+        state == LivenessState.passed ||
+        state == LivenessState.failed) {
+      return;
+    }
+
+    if (face == null) {
+      // Reset head turn and centering counts if face lost
+      _headTurnFrameCount = 0;
+      _centerFrameCount = 0;
+      return;
+    }
+
+    // Centering phase: wait for face to be frontal before declaring passed
+    if (state == LivenessState.centering) {
+      final eulerY = (face.headEulerAngleY ?? 0.0).abs();
+      final eulerX = (face.headEulerAngleX ?? 0.0).abs();
+      if (eulerY < _centerAngleThreshold && eulerX < _centerAngleThreshold) {
+        _centerFrameCount++;
+        if (_centerFrameCount >= _centerConfirmFrames) {
+          _pass();
+        }
+      } else {
+        _centerFrameCount = 0;
+      }
+      return;
+    }
+
+
+    // Waiting for face — once detected, start the challenge timer
+    if (state == LivenessState.waitingForFace) {
+      state = LivenessState.inProgress;
+      _startTimer();
+      notifyListeners();
+      return;
+    }
+
     if (currentChallenge == null) return;
 
     bool challengeCompleted = false;
@@ -67,23 +141,57 @@ class FaceLivenessController extends ChangeNotifier {
       case LivenessChallenge.blink:
         final leftEye = face.leftEyeOpenProbability ?? 1.0;
         final rightEye = face.rightEyeOpenProbability ?? 1.0;
-        challengeCompleted =
-            leftEye < _eyeClosedThreshold && rightEye < _eyeClosedThreshold;
+        final avgEye = (leftEye + rightEye) / 2.0;
+
+        // State machine: detect open → closed transition
+        if (avgEye > _eyeOpenThreshold) {
+          _eyesWereOpen = true;
+        } else if (_eyesWereOpen && avgEye < _eyeClosedThreshold) {
+          challengeCompleted = true;
+          _eyesWereOpen = false; // reset for next blink challenge if any
+        }
         break;
+
       case LivenessChallenge.turnLeft:
+        // Front camera mirrors horizontally: user turning LEFT appears as
+        // rightward motion in the image, so eulerY is positive.
         final eulerY = face.headEulerAngleY ?? 0.0;
-        challengeCompleted = eulerY < -_headTurnThreshold;
+        if (eulerY > _headTurnThreshold) {
+          _headTurnFrameCount++;
+          if (_headTurnFrameCount >= _headTurnConfirmFrames) {
+            challengeCompleted = true;
+            _headTurnFrameCount = 0;
+          }
+        } else {
+          _headTurnFrameCount = 0;
+        }
         break;
+
       case LivenessChallenge.turnRight:
+        // Front camera mirrors horizontally: user turning RIGHT appears as
+        // leftward motion in the image, so eulerY is negative.
         final eulerY = face.headEulerAngleY ?? 0.0;
-        challengeCompleted = eulerY > _headTurnThreshold;
+        if (eulerY < -_headTurnThreshold) {
+          _headTurnFrameCount++;
+          if (_headTurnFrameCount >= _headTurnConfirmFrames) {
+            challengeCompleted = true;
+            _headTurnFrameCount = 0;
+          }
+        } else {
+          _headTurnFrameCount = 0;
+        }
         break;
     }
 
     if (challengeCompleted) {
       _currentIndex++;
+      _eyesWereOpen = false;
+      _headTurnFrameCount = 0;
       if (_currentIndex >= _challenges.length) {
-        _pass();
+        // All challenges done — require face to return to centre before passing
+        state = LivenessState.centering;
+        _centerFrameCount = 0;
+        notifyListeners();
       } else {
         notifyListeners();
       }
@@ -109,14 +217,12 @@ class FaceLivenessController extends ChangeNotifier {
   }
 
   List<LivenessChallenge> _buildChallenges() {
-    // Randomise order per FR-11
     final challenges = [
       LivenessChallenge.blink,
       LivenessChallenge.turnLeft,
       LivenessChallenge.turnRight,
     ];
     challenges.shuffle();
-    // Use first two challenges for a shorter flow
     return challenges.take(2).toList();
   }
 

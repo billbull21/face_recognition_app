@@ -4,19 +4,38 @@ import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'package:image/image.dart' as img;
 import 'package:tflite_flutter/tflite_flutter.dart';
 
-/// Loads the MobileFaceNet TFLite model and generates 128-dim embeddings.
+/// Loads a face embedding TFLite model and generates embedding vectors.
+/// Input size and embedding size are read from the model at load time,
+/// so any compatible TFLite model works without code changes.
 class FaceEmbedder {
   static const String _modelPath = 'assets/models/mobilefacenet.tflite';
-  static const int _inputSize = 112;
-  static const int _embeddingSize = 128;
 
   Interpreter? _interpreter;
   bool _isLoaded = false;
+
+  /// Derived from the model's input tensor shape: [1, H, W, 3] → H (== W).
+  int _inputSize = 112;
+
+  /// Derived from the model's output tensor shape: [1, N] → N.
+  int _embeddingSize = 128;
 
   bool get isLoaded => _isLoaded;
 
   Future<void> loadModel() async {
     _interpreter = await Interpreter.fromAsset(_modelPath);
+
+    // Read actual input size from tensor shape [1, H, W, 3]
+    final inputShape = _interpreter!.getInputTensor(0).shape;
+    if (inputShape.length == 4) {
+      _inputSize = inputShape[1]; // H (assumes H == W)
+    }
+
+    // Read actual embedding size from output tensor shape [1, N]
+    final outputShape = _interpreter!.getOutputTensor(0).shape;
+    if (outputShape.length == 2) {
+      _embeddingSize = outputShape[1];
+    }
+
     _isLoaded = true;
   }
 
@@ -39,7 +58,9 @@ class FaceEmbedder {
 
     _interpreter!.run(input.reshape([1, _inputSize, _inputSize, 3]), output);
 
-    final embedding = Float32List.fromList((output[0] as List).cast<double>().map((v) => v.toDouble()).toList());
+    final embedding = Float32List.fromList(
+      (output[0] as List).cast<num>().map((v) => v.toDouble()).toList(),
+    );
     return _l2Normalize(embedding);
   }
 
