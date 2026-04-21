@@ -1,3 +1,4 @@
+import 'dart:math';
 import 'dart:typed_data';
 import 'package:camera/camera.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
@@ -142,7 +143,7 @@ class FaceEmbedder {
     for (final val in v) {
       norm += val * val;
     }
-    norm = norm == 0.0 ? 1.0 : norm;
+    norm = norm == 0.0 ? 1.0 : sqrt(norm);
     final scale = 1.0 / norm;
     return Float32List.fromList(v.map((e) => e * scale).toList());
   }
